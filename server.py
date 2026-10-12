@@ -91,13 +91,19 @@ class CallGuardHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "Unknown endpoint"}, status_code=404)
 
 
-def run_server(host: str = "127.0.0.1", port: int = 8050):
+def run_server(host: str = "127.0.0.1", port: int = 8050, remote_target=None, initial_mode: str = None):
+    if remote_target:
+        ENGINE.remote_target = remote_target
+    if initial_mode:
+        ENGINE.set_profile(initial_mode)
     ENGINE.start()
     server = ThreadingHTTPServer((host, port), CallGuardHandler)
     print("=" * 65)
     print("  CallGuard - Predict Video Call Quality Before It Drops")
     print("=" * 65)
-    print(f"  [UDP Engine]  Listening on 127.0.0.1:5005 (AF_INET, SOCK_DGRAM)")
+    print(f"  [UDP Engine]  Listening on {ENGINE.udp_host}:{ENGINE.udp_port} (AF_INET, SOCK_DGRAM)")
+    if ENGINE.remote_target:
+        print(f"  [Remote Peer] Targeting {ENGINE.remote_target[0]}:{ENGINE.remote_target[1]} (RTT Echo Mode)")
     print(f"  [Dashboard]   Open http://{host}:{port} in your browser")
     print("=" * 65)
     print("  Press Ctrl+C to stop the server.")
@@ -110,5 +116,18 @@ def run_server(host: str = "127.0.0.1", port: int = 8050):
 
 
 if __name__ == "__main__":
-    port_arg = int(sys.argv[1]) if len(sys.argv) > 1 else 8050
-    run_server(port=port_arg)
+    import argparse
+    parser = argparse.ArgumentParser(description="CallGuard Web Server & UDP Engine")
+    parser.add_argument("port_pos", nargs="?", type=int, default=None, help="Optional positional HTTP port")
+    parser.add_argument("--port", type=int, default=8050, help="HTTP server port (default: 8050)")
+    parser.add_argument("--remote", type=str, default=None, help="Optional remote UDP peer IP:PORT for real_udp RTT testing")
+    parser.add_argument("--mode", type=str, default=None, help="Initial profile (e.g. real_udp, optimal, degrading)")
+    args = parser.parse_args()
+
+    http_port = args.port_pos if args.port_pos is not None else args.port
+    remote_tuple = None
+    if args.remote:
+        r_host, r_port = args.remote.rsplit(":", 1)
+        remote_tuple = (r_host, int(r_port))
+
+    run_server(port=http_port, remote_target=remote_tuple, initial_mode=args.mode)
