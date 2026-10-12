@@ -54,8 +54,9 @@
 
           <div class="mos-comparison">
             <div class="mos-cell">
-              <span class="mos-caption">Current MOS</span>
+              <span class="mos-caption">Video QoS MOS</span>
               <div class="mos-number"><span id="currentMos">4.4</span><small>/4.5</small></div>
+              <span class="mos-caption" id="g107MosText">ITU-T G.107: 4.41 (R=91.5)</span>
             </div>
             <div class="mos-divider">
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -63,8 +64,9 @@
               </svg>
             </div>
             <div class="mos-cell forecast">
-              <span class="mos-caption">+5s Forecast</span>
+              <span class="mos-caption">+5s Regression</span>
               <div class="mos-number"><span id="predictedMos">4.4</span><small>/4.5</small></div>
+              <span class="mos-caption" id="baselineMosText">Baseline: 4.40 | MAE: --</span>
             </div>
           </div>
         </section>
@@ -72,16 +74,25 @@
         <!-- 2. NETWORK CONDITION SWITCHBOARD -->
         <section class="switchboard">
           <div class="block-header">
-            <span class="section-kicker">01 / CONTROLLED NETWORK TEST</span>
-            <p>Select a network profile to inject delay, jitter, or packet loss into the live UDP stream.</p>
+            <span class="section-kicker">01 / MEASUREMENT &amp; SIMULATION MODES</span>
+            <p>Select Real UDP Wire Mode for unimpaired socket measurements, or a controlled impairment profile.</p>
           </div>
 
           <div class="switch-list">
+            <button class="switch-btn" data-profile="real_udp">
+              <span class="sw-num">00</span>
+              <div class="sw-text">
+                <strong>Real UDP Socket Mode (Unimpaired Wire)</strong>
+                <small>Actual OS socket latency, RFC 3550 jitter &amp; wire throughput</small>
+              </div>
+              <span class="sw-indicator"></span>
+            </button>
+
             <button class="switch-btn active" data-profile="optimal">
               <span class="sw-num">01</span>
               <div class="sw-text">
-                <strong>Nominal Fiber / Wi-Fi</strong>
-                <small>18ms delay, 2ms jitter, 0% loss</small>
+                <strong>Nominal Fiber / Wi-Fi (Simulated)</strong>
+                <small>18ms delay, 2ms jitter, 0% loss, 2400 kbps</small>
               </div>
               <span class="sw-indicator"></span>
             </button>
@@ -98,7 +109,7 @@
             <button class="switch-btn" data-profile="jitter_spike">
               <span class="sw-num">03</span>
               <div class="sw-text">
-                <strong>High Jitter / Bufferbloat</strong>
+                <strong>High Jitter / Bufferbloat (Simulated)</strong>
                 <small>Irregular packet spacing above 35ms</small>
               </div>
               <span class="sw-indicator"></span>
@@ -107,7 +118,7 @@
             <button class="switch-btn" data-profile="packet_loss">
               <span class="sw-num">04</span>
               <div class="sw-text">
-                <strong>Weak Signal (Packet Loss)</strong>
+                <strong>Weak Signal (Simulated Packet Loss)</strong>
                 <small>Drops ~9% of UDP sequence numbers</small>
               </div>
               <span class="sw-indicator"></span>
@@ -116,7 +127,7 @@
             <button class="switch-btn" data-profile="bandwidth_drop">
               <span class="sw-num">05</span>
               <div class="sw-text">
-                <strong>Bandwidth Bottleneck</strong>
+                <strong>Bandwidth Bottleneck (Simulated)</strong>
                 <small>Restricts link speed below 400 kbps</small>
               </div>
               <span class="sw-indicator"></span>
@@ -239,24 +250,24 @@
 
           <div class="packet-strip">
             <div class="strip-item">
-              <span>TRANSPORT</span>
-              <code>AF_INET / SOCK_DGRAM</code>
+              <span>DATA SOURCE</span>
+              <code id="statMode">SIMULATOR</code>
             </div>
             <div class="strip-item">
-              <span>HEADER FORMAT</span>
-              <code>!IdI (16 Bytes)</code>
+              <span>ACTUAL WIRE SOCKET</span>
+              <code id="statWire">0.2ms / 180kbps</code>
             </div>
             <div class="strip-item">
-              <span>DATAGRAMS SENT</span>
-              <code id="statSent">0</code>
+              <span>SENT / UNIQUE RECV</span>
+              <code><span id="statSent">0</span> / <span id="statRecv">0</span></code>
             </div>
             <div class="strip-item">
-              <span>DATAGRAMS RECV</span>
-              <code id="statRecv">0</code>
+              <span>LOST / OOO / DUP</span>
+              <code><span id="statLost">0</span> / <span id="statOoo">0</span> / <span id="statDup">0</span></code>
             </div>
             <div class="strip-item">
-              <span>SEQUENCE DROPS</span>
-              <code id="statLost">0</code>
+              <span>HEADER (!IddIHB)</span>
+              <code>27B Monotonic</code>
             </div>
           </div>
         </section>

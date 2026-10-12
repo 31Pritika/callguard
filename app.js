@@ -134,8 +134,23 @@ function updateUI(state) {
   alertHeadline.textContent = cur.prediction_Headline;
   alertQos.textContent = cur.qos_action;
 
-  currentMosEl.textContent = cur.mos.toFixed(1);
-  predictedMosEl.textContent = cur.predicted_mos_5s.toFixed(1);
+  currentMosEl.textContent = cur.mos.toFixed(2);
+  predictedMosEl.textContent = cur.predicted_mos_5s.toFixed(2);
+
+  const g107MosText = document.getElementById("g107MosText");
+  if (g107MosText && cur.mos_g107 !== undefined) {
+    g107MosText.textContent = `ITU-T G.107: ${cur.mos_g107.toFixed(2)} (R=${cur.r_factor_g107.toFixed(1)})`;
+  }
+
+  const baselineMosText = document.getElementById("baselineMosText");
+  if (baselineMosText) {
+    const valSummary = state.live_validation || {};
+    const maeStr = valSummary.reg_mos_mae !== null && valSummary.reg_mos_mae !== undefined
+      ? `MAE: ${valSummary.reg_mos_mae.toFixed(2)}`
+      : "MAE: collecting";
+    const baseVal = cur.baseline_mos_5s !== undefined ? cur.baseline_mos_5s.toFixed(2) : cur.mos.toFixed(2);
+    baselineMosText.textContent = `Base: ${baseVal} | ${maeStr}`;
+  }
 
   if (cur.est_sec_to_drop !== null) {
     dropCountdownEl.textContent = `Instability in ~${cur.est_sec_to_drop}s`;
@@ -146,13 +161,13 @@ function updateUI(state) {
   }
 
   // 2. Telemetry matrix
-  valLatency.textContent = cur.latency_ms.toFixed(0);
+  valLatency.textContent = cur.latency_ms < 10 ? cur.latency_ms.toFixed(2) : cur.latency_ms.toFixed(0);
   const latSign = cur.lat_slope >= 0 ? "+" : "";
   slopeLatency.textContent = `${latSign}${cur.lat_slope.toFixed(1)} ms/s`;
   const latLevel = cur.latency_ms >= 150 ? "crit" : cur.latency_ms >= 100 || cur.lat_slope > 6 ? "warn" : "ok";
   setCellMeter(tagLatency, barLatency, latLevel, (cur.latency_ms / 200) * 100);
 
-  valJitter.textContent = cur.jitter_ms.toFixed(1);
+  valJitter.textContent = cur.jitter_ms < 10 ? cur.jitter_ms.toFixed(2) : cur.jitter_ms.toFixed(1);
   const jitSign = cur.jit_slope >= 0 ? "+" : "";
   slopeJitter.textContent = `${jitSign}${cur.jit_slope.toFixed(1)} ms/s`;
   const jitLevel = cur.jitter_ms >= 30 ? "crit" : cur.jitter_ms >= 20 || cur.jit_slope > 1.8 ? "warn" : "ok";
@@ -172,9 +187,23 @@ function updateUI(state) {
   setCellMeter(tagBandwidth, barBandwidth, bwLevel, (cur.bandwidth_kbps / 2500) * 100);
 
   // 3. Packet strip
+  const statMode = document.getElementById("statMode");
+  const statWire = document.getElementById("statWire");
+  const statOoo = document.getElementById("statOoo");
+  const statDup = document.getElementById("statDup");
+
+  if (statMode) {
+    statMode.textContent = state.measurement_mode === "real_udp" ? "REAL UDP WIRE" : "SIMULATOR";
+  }
+  if (statWire && cur.actual_wire_metrics) {
+    const wm = cur.actual_wire_metrics;
+    statWire.textContent = `${wm.wire_latency_ms.toFixed(2)}ms / ${wm.wire_throughput_kbps.toFixed(0)}kbps`;
+  }
   statSent.textContent = state.packets.sent;
   statRecv.textContent = state.packets.received;
   statLost.textContent = state.packets.lost;
+  if (statOoo) statOoo.textContent = state.packets.out_of_order || 0;
+  if (statDup) statDup.textContent = state.packets.duplicates || 0;
 
   // 4. Plot
   drawPlot(state.history);
