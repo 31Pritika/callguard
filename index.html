@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CallGuard / Real-Time UDP Call Stability Monitor</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif&family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="shell">
+    <!-- TOP ARCHITECTURAL MASTHEAD -->
+    <header class="masthead">
+      <div class="masthead-left">
+        <h1>CallGuard</h1>
+        <span class="masthead-sub">Predictive UDP Video Call Quality Monitor</span>
+      </div>
+      <div class="masthead-right">
+        <div class="socket-readout">
+          <span class="pulse-dot" id="liveDot"></span>
+          <span>UDP SOCKET <code>127.0.0.1:5005</code></span>
+        </div>
+        <button class="btn-Action" id="resetBtn">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+            <path d="M3 3v5h5" />
+          </svg>
+          Reset Stream
+        </button>
+      </div>
+    </header>
+
+    <!-- ASYMMETRIC SPLIT WORKSPACE -->
+    <main class="split-grid">
+      <!-- LEFT SPINE: VERDICT + SCENARIO SWITCHBOARD -->
+      <aside class="left-spine">
+        <!-- 1. PRIMARY PREDICTION VERDICT -->
+        <section class="verdict-block state-stable" id="alertBanner" aria-live="polite">
+          <div class="verdict-top">
+            <span class="verdict-pill" id="alertBadge">CALL STABLE</span>
+            <span class="verdict-countdown" id="dropCountdown">Nominal trajectory</span>
+          </div>
+
+          <h2 class="verdict-headline" id="alertHeadline">
+            All UDP metrics are within safe bounds for real-time video.
+          </h2>
+
+          <div class="qos-prescription">
+            <span class="qos-label">QoS Policy</span>
+            <p id="alertQos">Maintain 1080p HD @ 60fps with 20ms jitter buffer</p>
+          </div>
+
+          <div class="mos-comparison">
+            <div class="mos-cell">
+              <span class="mos-caption">Current MOS</span>
+              <div class="mos-number"><span id="currentMos">4.4</span><small>/4.5</small></div>
+            </div>
+            <div class="mos-divider">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M5 12h14M13 5l7 7-7 7" />
+              </svg>
+            </div>
+            <div class="mos-cell forecast">
+              <span class="mos-caption">+5s Forecast</span>
+              <div class="mos-number"><span id="predictedMos">4.4</span><small>/4.5</small></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 2. NETWORK CONDITION SWITCHBOARD -->
+        <section class="switchboard">
+          <div class="block-header">
+            <span class="section-kicker">01 / CONTROLLED NETWORK TEST</span>
+            <p>Select a network profile to inject delay, jitter, or packet loss into the live UDP stream.</p>
+          </div>
+
+          <div class="switch-list">
+            <button class="switch-btn active" data-profile="optimal">
+              <span class="sw-num">01</span>
+              <div class="sw-text">
+                <strong>Nominal Fiber / Wi-Fi</strong>
+                <small>18ms delay, 2ms jitter, 0% loss</small>
+              </div>
+              <span class="sw-indicator"></span>
+            </button>
+
+            <button class="switch-btn" data-profile="degrading">
+              <span class="sw-num">02</span>
+              <div class="sw-text">
+                <strong>Gradual Congestion (Early Warning Demo)</strong>
+                <small>Slowly ramps delay and jitter over 15 seconds</small>
+              </div>
+              <span class="sw-indicator"></span>
+            </button>
+
+            <button class="switch-btn" data-profile="jitter_spike">
+              <span class="sw-num">03</span>
+              <div class="sw-text">
+                <strong>High Jitter / Bufferbloat</strong>
+                <small>Irregular packet spacing above 35ms</small>
+              </div>
+              <span class="sw-indicator"></span>
+            </button>
+
+            <button class="switch-btn" data-profile="packet_loss">
+              <span class="sw-num">04</span>
+              <div class="sw-text">
+                <strong>Weak Signal (Packet Loss)</strong>
+                <small>Drops ~9% of UDP sequence numbers</small>
+              </div>
+              <span class="sw-indicator"></span>
+            </button>
+
+            <button class="switch-btn" data-profile="bandwidth_drop">
+              <span class="sw-num">05</span>
+              <div class="sw-text">
+                <strong>Bandwidth Bottleneck</strong>
+                <small>Restricts link speed below 400 kbps</small>
+              </div>
+              <span class="sw-indicator"></span>
+            </button>
+          </div>
+
+          <!-- Manual Faders -->
+          <details class="manual-drawer">
+            <summary>
+              <span>Manual Parameter Override</span>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M6 9l6 6 6-6" />
+              </svg>
+            </summary>
+            <div class="fader-stack">
+              <label>
+                <div class="fader-row"><span>Base Latency</span><code><b id="lblSliderLat">35</b> ms</code></div>
+                <input type="range" id="sliderLat" min="5" max="220" value="35" />
+              </label>
+              <label>
+                <div class="fader-row"><span>Jitter Variance</span><code><b id="lblSliderJit">6</b> ms</code></div>
+                <input type="range" id="sliderJit" min="1" max="60" value="6" />
+              </label>
+              <label>
+                <div class="fader-row"><span>UDP Packet Loss</span><code><b id="lblSliderLoss">0.5</b> %</code></div>
+                <input type="range" id="sliderLoss" min="0" max="20" step="0.5" value="0.5" />
+              </label>
+              <label>
+                <div class="fader-row"><span>Link Bandwidth</span><code><b id="lblSliderBw">1800</b> kbps</code></div>
+                <input type="range" id="sliderBw" min="200" max="3000" step="50" value="1800" />
+              </label>
+              <button class="btn-apply" id="applyCustomBtn">Commit Custom Parameters</button>
+            </div>
+          </details>
+        </section>
+      </aside>
+
+      <!-- RIGHT SHEET: 4 TELEMETRY READOUTS + OSCILLOSCOPE CHART + CONCEPT NOTES -->
+      <div class="right-sheet">
+        <!-- 4 ARCHITECTURAL METRIC CELLS -->
+        <section class="telemetry-matrix">
+          <!-- Latency -->
+          <article class="metric-cell" id="cardLatency">
+            <div class="cell-head">
+              <span class="cell-label">01 / ONE-WAY LATENCY</span>
+              <span class="cell-status" id="tagLatency">NOMINAL</span>
+            </div>
+            <div class="cell-reading">
+              <span class="reading-val" id="valLatency">18</span>
+              <span class="reading-unit">ms</span>
+              <span class="reading-slope" id="slopeLatency">+0.0 ms/s</span>
+            </div>
+            <div class="meter-track"><div class="meter-fill" id="barLatency"></div></div>
+            <p class="cell-note">Time for a UDP packet to reach the receiver. Safe under 100 ms; critical above 150 ms.</p>
+          </article>
+
+          <!-- Jitter -->
+          <article class="metric-cell" id="cardJitter">
+            <div class="cell-head">
+              <span class="cell-label">02 / RFC 3550 JITTER</span>
+              <span class="cell-status" id="tagJitter">NOMINAL</span>
+            </div>
+            <div class="cell-reading">
+              <span class="reading-val" id="valJitter">2.0</span>
+              <span class="reading-unit">ms</span>
+              <span class="reading-slope" id="slopeJitter">+0.0 ms/s</span>
+            </div>
+            <div class="meter-track"><div class="meter-fill" id="barJitter"></div></div>
+            <p class="cell-note">Variation in packet arrival spacing. Safe under 20 ms; causes audio stutter above 30 ms.</p>
+          </article>
+
+          <!-- Packet Loss -->
+          <article class="metric-cell" id="cardLoss">
+            <div class="cell-head">
+              <span class="cell-label">03 / UDP PACKET LOSS</span>
+              <span class="cell-status" id="tagLoss">NOMINAL</span>
+            </div>
+            <div class="cell-reading">
+              <span class="reading-val" id="valLoss">0.0</span>
+              <span class="reading-unit">%</span>
+              <span class="reading-slope" id="pktGapText">0 dropped</span>
+            </div>
+            <div class="meter-track"><div class="meter-fill" id="barLoss"></div></div>
+            <p class="cell-note">Detected via missing UDP sequence numbers. Safe under 2%; freezes video above 5%.</p>
+          </article>
+
+          <!-- Bandwidth -->
+          <article class="metric-cell" id="cardBandwidth">
+            <div class="cell-head">
+              <span class="cell-label">04 / AVAILABLE BANDWIDTH</span>
+              <span class="cell-status" id="tagBandwidth">NOMINAL</span>
+            </div>
+            <div class="cell-reading">
+              <span class="reading-val" id="valBandwidth">2400</span>
+              <span class="reading-unit">kbps</span>
+              <span class="reading-slope" id="bwModeText">1080p HD</span>
+            </div>
+            <div class="meter-track"><div class="meter-fill" id="barBandwidth"></div></div>
+            <p class="cell-note">Throughput measured over a 2.5s window. HD video needs 1200+ kbps; minimum video is 450 kbps.</p>
+          </article>
+        </section>
+
+        <!-- PRECISION TELEMETRY PLOT -->
+        <section class="plot-section">
+          <div class="plot-header">
+            <div>
+              <span class="section-kicker">02 / REAL-TIME DELAY TRAJECTORY</span>
+              <h3>Latency &amp; Jitter vs. 150ms Call Drop Ceiling</h3>
+            </div>
+            <div class="plot-legend">
+              <span><i class="swatch cobalt"></i> Latency (ms)</span>
+              <span><i class="swatch amber"></i> RFC 3550 Jitter (ms)</span>
+              <span><i class="swatch crimson"></i> 150ms Ceiling</span>
+            </div>
+          </div>
+
+          <div class="canvas-frame">
+            <canvas id="latencyChart" width="820" height="240"></canvas>
+          </div>
+
+          <div class="packet-strip">
+            <div class="strip-item">
+              <span>TRANSPORT</span>
+              <code>AF_INET / SOCK_DGRAM</code>
+            </div>
+            <div class="strip-item">
+              <span>HEADER FORMAT</span>
+              <code>!IdI (16 Bytes)</code>
+            </div>
+            <div class="strip-item">
+              <span>DATAGRAMS SENT</span>
+              <code id="statSent">0</code>
+            </div>
+            <div class="strip-item">
+              <span>DATAGRAMS RECV</span>
+              <code id="statRecv">0</code>
+            </div>
+            <div class="strip-item">
+              <span>SEQUENCE DROPS</span>
+              <code id="statLost">0</code>
+            </div>
+          </div>
+        </section>
+
+        <!-- EDITORIAL CONCEPT REFERENCE -->
+        <section class="editorial-notes">
+          <div class="note-col">
+            <span class="note-index">I. UDP Framing</span>
+            <p>Each packet carries a 4-byte sequence number, 8-byte timestamp, and 4-byte frame size so the receiver can detect drops without TCP retransmissions.</p>
+          </div>
+          <div class="note-col">
+            <span class="note-index">II. RFC 3550 Jitter</span>
+            <p>Interarrival jitter is smoothed continuously using the RTP standard formula <code>J = J + (|D| - J)/16</code> to measure timing instability.</p>
+          </div>
+          <div class="note-col">
+            <span class="note-index">III. Slope Forecasting</span>
+            <p>Linear regression over the last 4 seconds projects delay and ITU-T MOS 5 seconds ahead, alerting you before the call crosses into failure.</p>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
