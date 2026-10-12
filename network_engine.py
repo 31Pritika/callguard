@@ -55,8 +55,8 @@ class CallGuardEngine:
             "base_latency_ms": 0.0,
             "jitter_ms": 0.0,
             "loss_prob": 0.0,
-            "bandwidth_kbps": 1536.0,  # Target physical wire send rate: 40 pkts/s * 1200B * 8 = 384 kbps (or scaled rate)
-            "wire_pps": 100,          # 100 pkts/s * 1200B * 8 = 960 kbps real physical UDP traffic
+            "bandwidth_kbps": 1536.0,
+            "wire_pps": 125,          # 125 pkts/s * 1227B * 8 = ~1227 kbps real physical UDP traffic
             "wire_payload_bytes": 1200,
             "is_degrading": False,
         },
@@ -134,6 +134,7 @@ class CallGuardEngine:
         self.out_of_order_packets = 0    # Packets arriving with seq_num < max_seq_seen
         self.duplicate_packets = 0       # Packets with seq_num already received
         self.timestamp_anomalies = 0     # Packets with negative or stale (>30s) timestamps
+        self.min_seq_seen = None
         self.max_seq_seen = None
         self.received_seq_set = set()
         self.received_seq_order = deque(maxlen=4000)
@@ -218,6 +219,7 @@ class CallGuardEngine:
         self.prev_effective_transit_ms = None
         self.effective_rfc_jitter_ms = self.sim_params.get("jitter_ms", 0.0)
         # Reset sequence gap baseline for the new test window
+        self.min_seq_seen = None
         self.max_seq_seen = None
         self.received_seq_set.clear()
         self.received_seq_order.clear()
@@ -232,6 +234,7 @@ class CallGuardEngine:
             self.out_of_order_packets = 0
             self.duplicate_packets = 0
             self.timestamp_anomalies = 0
+            self.min_seq_seen = None
             self.max_seq_seen = None
             self.received_seq_set.clear()
             self.received_seq_order.clear()
@@ -315,24 +318,31 @@ class CallGuardEngine:
             self._record_seen_seq(seq_num)
             self.total_received += 1
 
+            if self.min_seq_seen is None:
+                self.min_seq_seen = seq_num
+
             if self.max_seq_seen is None:
                 self.max_seq_seen = seq_num
+                is_in_order = True
             elif seq_num > self.max_seq_seen:
                 gap = seq_num - self.max_seq_seen - 1
                 if gap > 0:
                     self.total_lost += gap
                 self.max_seq_seen = seq_num
-            elif seq_num < self.max_seq_seen:
+                is_in_order = True
+            else:
                 # Packet arrived out of order (after a higher sequence number was already seen)
                 self.out_of_order_packets += 1
-                # Reconcile total_lost since this sequence number was previously counted in a gap
-                if self.total_lost > 0:
+                is_in_order = False
+                # Reconcile total_lost only if this sequence number was part of a gap after min_seq_seen
+                if self.total_lost > 0 and self.min_seq_seen is not None and seq_num > self.min_seq_seen:
                     self.total_lost -= 1
 
             # 4. RFC 3550 (RTP) Interarrival Jitter Calculation:
             # J(i) = J(i-1) + ( |D(i-1, i)| - J(i-1) ) / 16
-            # Only update jitter on valid timestamps and unique packets
-            if valid_timestamp:
+            # Only update jitter on valid timestamps and in-order packets so late out-of-order
+            # packets do not corrupt the transit-time reference with a double delta spike.
+            if valid_timestamp and is_in_order:
                 if self.prev_wire_transit_ms is not None:
                     d_wire = abs(wire_latency_ms - self.prev_wire_transit_ms)
                     self.wire_rfc_jitter_ms += (d_wire - self.wire_rfc_jitter_ms) / 16.0
@@ -352,6 +362,8 @@ class CallGuardEngine:
                 "wire_bytes": wire_bytes,
                 "sim_bytes": sim_media_bytes if is_sim_pkt else wire_bytes,
                 "is_simulated": is_sim_pkt,
+                "is_in_order": is_in_order,
+                "valid_ts": valid_timestamp,
             })
             self._prune_window(recv_perf)
 
@@ -365,6 +377,7 @@ class CallGuardEngine:
     # =========================================================================
     def _udp_sender_loop(self, shared_sock: socket.socket):
         last_send_perf = time.perf_counter() - 0.025
+        real_pkt_budget = 0.0
 
         while self.running:
             now_perf = time.perf_counter()
@@ -375,14 +388,40 @@ class CallGuardEngine:
             mode = params.get("mode", "simulation")
 
             if mode == "real_udp":
-                packets_per_sec = params.get("wire_pps", 80)
+                packets_per_sec = params.get("wire_pps", 125)
                 interval = 1.0 / packets_per_sec
                 wire_payload_size = params.get("wire_payload_bytes", 1200)
                 sim_delay_ms = 0.0
                 sim_media_bytes = 0
                 flags = FLAG_ECHO_REQ if self.remote_target else 0x00
-                drop_packet = False
+                # Compensate for OS sleep timer granularity (e.g. 15.6ms on Windows)
+                real_pkt_budget += dt * packets_per_sec
+                burst_count = min(4, max(1, int(real_pkt_budget)))
+                real_pkt_budget = max(0.0, real_pkt_budget - burst_count)
+                target = self.remote_target if self.remote_target else (self.udp_host, self.udp_port)
+                payload = b"V" * wire_payload_size
+
+                for _ in range(burst_count):
+                    with self.lock:
+                        self.total_sent += 1
+                        current_seq = self.seq_num
+                        self.seq_num += 1
+                    send_ts = time.perf_counter()
+                    header = struct.pack(
+                        PACKET_HEADER_FORMAT,
+                        current_seq,
+                        send_ts,
+                        sim_delay_ms,
+                        sim_media_bytes,
+                        wire_payload_size,
+                        flags,
+                    )
+                    try:
+                        shared_sock.sendto(header + payload, target)
+                    except OSError:
+                        pass
             else:
+                real_pkt_budget = 0.0
                 packets_per_sec = 40
                 interval = 1.0 / packets_per_sec
                 target_bps = max(80_000.0, params["bandwidth_kbps"] * 1000.0)
@@ -394,28 +433,27 @@ class CallGuardEngine:
                 flags = FLAG_SIMULATED
                 drop_packet = random.random() < params["loss_prob"]
 
-            with self.lock:
-                self.total_sent += 1
-                current_seq = self.seq_num
-                self.seq_num += 1
+                with self.lock:
+                    self.total_sent += 1
+                    current_seq = self.seq_num
+                    self.seq_num += 1
 
-            if not drop_packet:
-                send_ts = time.perf_counter()
-                header = struct.pack(
-                    PACKET_HEADER_FORMAT,
-                    current_seq,
-                    send_ts,
-                    sim_delay_ms,
-                    sim_media_bytes,
-                    wire_payload_size,
-                    flags,
-                )
-                payload = b"V" * wire_payload_size
-                target = self.remote_target if (mode == "real_udp" and self.remote_target) else (self.udp_host, self.udp_port)
-                try:
-                    shared_sock.sendto(header + payload, target)
-                except OSError:
-                    pass
+                if not drop_packet:
+                    send_ts = time.perf_counter()
+                    header = struct.pack(
+                        PACKET_HEADER_FORMAT,
+                        current_seq,
+                        send_ts,
+                        sim_delay_ms,
+                        sim_media_bytes,
+                        wire_payload_size,
+                        flags,
+                    )
+                    payload = b"V" * wire_payload_size
+                    try:
+                        shared_sock.sendto(header + payload, (self.udp_host, self.udp_port))
+                    except OSError:
+                        pass
 
             elapsed = time.perf_counter() - now_perf
             sleep_time = max(0.002, interval - elapsed)
@@ -546,6 +584,138 @@ class CallGuardEngine:
         denominator = sum((x - x_mean) ** 2 for x in x_vals)
         return numerator / denominator if denominator > 1e-9 else 0.0
 
+    @staticmethod
+    def _ols_slope_and_r2(values: list, dt: float = 0.5) -> tuple:
+        """
+        Computes both the OLS linear slope (change per second) and coefficient of
+        determination R^2 in [0.0, 1.0] over strictly past/present values.
+        """
+        n = len(values)
+        if n < 3:
+            return 0.0, 0.0
+        x_vals = [i * dt for i in range(n)]
+        x_mean = sum(x_vals) / n
+        y_mean = sum(values) / n
+        numerator = sum((x - x_mean) * (y - y_mean) for x, y in zip(x_vals, values))
+        denominator = sum((x - x_mean) ** 2 for x in x_vals)
+        if denominator <= 1e-9:
+            return 0.0, 0.0
+        slope = numerator / denominator
+        ss_tot = sum((y - y_mean) ** 2 for y in values)
+        if ss_tot <= 1e-9:
+            return slope, 0.0
+        ss_res = sum((y - (y_mean + slope * (x - x_mean))) ** 2 for x, y in zip(x_vals, values))
+        r2 = max(0.0, min(1.0, 1.0 - (ss_res / ss_tot)))
+        return slope, r2
+
+    @classmethod
+    def _adaptive_forecast(
+        cls,
+        series_2p5s: list,
+        series_0p5s: list,
+        dt: float = 0.5,
+        horizon: float = 5.0,
+        metric_type: str = "latency",
+        is_step_regime: bool = False,
+    ) -> tuple:
+        """
+        Causal Adaptive Regime-Aware Hybrid Predictor (zero future leakage):
+        Combines the 2.5s sliding-window series (low variance) with the 0.5s instantaneous
+        sub-window series (zero moving-average lag) to distinguish four network regimes:
+          1. Step-Jump Discontinuity: High Jump Dominance Ratio (>=56% of range in a single 0.5s
+             step) -> anchors to the post-step plateau mean instead of extrapolating the 2.5s
+             boxcar ramp overshoot.
+          2. Post-Transition Plateau: Smoothed 2.5s window still shows a residual slope from an
+             earlier transition, but the recent 4-5 instantaneous 0.5s buckets have flattened ->
+             anchors to the recent 3-step plateau mean.
+          3. Active Multi-Step Ramp: Both the 5-step (2.0s) instantaneous sub-window and 8-step
+             (3.5s) smoothed window confirm a sustained linear trend -> extrapolates across the
+             4.0s center-to-center lead time from the instantaneous anchor.
+          4. Stationary / Noisy Regime: R^2-gated damping prevents binomial packet-loss or
+             Gaussian jitter fluctuations from causing false 5-second trend excursions.
+        """
+        cur_val = series_2p5s[-1]
+        if not series_0p5s:
+            return cur_val, 0.0, False
+        inst_val = series_0p5s[-1]
+
+        if len(series_0p5s) < 3:
+            return cur_val, 0.0, False
+
+        w_inst = series_0p5s[-8:]
+        w_smooth = series_2p5s[-8:]
+        total_range = max(w_inst) - min(w_inst)
+        deltas = [w_inst[i] - w_inst[i - 1] for i in range(1, len(w_inst))]
+        abs_deltas = [abs(d) for d in deltas]
+        max_jump = max(abs_deltas) if abs_deltas else 0.0
+        jump_idx = abs_deltas.index(max_jump) if abs_deltas else 0
+        jump_dominance = (max_jump / total_range) if total_range > 1e-6 else 0.0
+
+        slope_sm8, r2_sm8 = cls._ols_slope_and_r2(w_smooth, dt)
+        slope_sm5, r2_sm5 = cls._ols_slope_and_r2(w_smooth[-5:], dt)
+        slope_inst5, r2_inst5 = cls._ols_slope_and_r2(w_inst[-5:], dt)
+        slope_inst4, r2_inst4 = cls._ols_slope_and_r2(w_inst[-4:], dt)
+
+        if metric_type == "loss":
+            if is_step_regime:
+                if len(w_inst) >= 3 and cur_val < sum(w_inst[-2:]) / 2.0:
+                    return 0.5 * cur_val + 0.5 * (sum(w_inst[-2:]) / 2.0), 0.0, True
+                if len(w_inst) >= 2 and max(w_inst[-2:]) <= 0.01 and slope_sm8 < -0.2:
+                    return 0.0, 0.0, True
+                return cur_val, 0.0, True
+            if len(w_inst) >= 2 and max(w_inst[-2:]) <= 0.01 and slope_sm8 < -0.2:
+                return 0.0, 0.0, True
+            if r2_sm8 >= 0.65 and slope_sm8 * slope_sm5 > 0 and slope_sm8 * slope_inst5 > 0:
+                eff_slope = slope_sm8 * (r2_sm8 ** 2) * 0.70
+                return max(0.0, cur_val + eff_slope * horizon), eff_slope, False
+            return cur_val, 0.0, False
+
+        if metric_type == "jitter":
+            if is_step_regime:
+                plateau_est = 0.5 * cur_val + 0.5 * (sum(w_inst[-2:]) / len(w_inst[-2:]))
+                return plateau_est, 0.0, True
+            if len(w_inst) >= 5 and abs(slope_sm8) > 0.5:
+                if (slope_inst4 * slope_sm8 <= 0) and abs(inst_val - cur_val) > 2.0:
+                    return sum(w_inst[-3:]) / len(w_inst[-3:]), 0.0, True
+            if r2_sm8 >= 0.55:
+                eff_slope = slope_sm8 * (r2_sm8 ** 1.2)
+                return max(0.05, cur_val + eff_slope * horizon), eff_slope, False
+            if r2_sm5 >= 0.65:
+                eff_slope = slope_sm5 * (r2_sm5 ** 1.2)
+                return max(0.05, cur_val + eff_slope * horizon), eff_slope, False
+            return cur_val, 0.0, False
+
+        # Primary metrics: 'latency' or 'bandwidth'
+        # 1. Step-Jump Discontinuity Detection on 0.5s Instant Series:
+        if jump_dominance >= 0.56 and total_range > 0.14 * max(abs(cur_val), 1.0):
+            post_step_vals = w_inst[jump_idx + 1:]
+            plateau_est = sum(post_step_vals) / len(post_step_vals)
+            return plateau_est, 0.0, True
+
+        # 2. Post-Transition Plateau Detection:
+        if abs(slope_sm8) > 1.0:
+            if (slope_inst4 * slope_sm8 <= 0) or (abs(slope_inst4) < 0.30 * abs(slope_sm8) and r2_inst4 < 0.45):
+                plateau_est = sum(w_inst[-3:]) / len(w_inst[-3:])
+                return plateau_est, 0.0, True
+
+        # 3. Active Multi-Step Ramp Detection:
+        if len(w_inst) >= 5 and r2_inst5 >= 0.78 and jump_dominance < 0.52:
+            eff_slope = (
+                (0.6 * slope_inst5 + 0.4 * slope_sm8)
+                if (slope_inst5 * slope_sm8 > 0 and r2_sm8 >= 0.70)
+                else slope_inst5
+            )
+            damped_slope = eff_slope * (r2_inst5 ** 1.2)
+            return inst_val + damped_slope * 4.0, damped_slope, False
+
+        if r2_sm8 >= 0.75 and slope_inst5 * slope_sm8 > 0:
+            eff_slope = slope_sm8 * (r2_sm8 ** 1.5)
+            return cur_val + eff_slope * horizon, eff_slope, False
+
+        # 4. Stationary / Low-R^2 Regime:
+        eff_slope = slope_sm8 * (r2_sm8 ** 3) * 0.25
+        return cur_val + eff_slope * horizon, eff_slope, True
+
     # =========================================================================
     # 4. SAMPLER & ROLLING PREDICTION VALIDATION LOOP
     # =========================================================================
@@ -563,9 +733,11 @@ class CallGuardEngine:
                     if past_snap.get("measurement_mode") == snapshot.get("measurement_mode"):
                         self.validation_pairs.append({
                             "pred_mos": past_snap["predicted_mos_5s"],
+                            "ols_mos": past_snap.get("ols_predicted_mos_5s", past_snap["predicted_mos_5s"]),
                             "base_mos": past_snap["baseline_mos_5s"],
                             "actual_mos": snapshot["mos"],
                             "pred_lat": past_snap["predicted_latency_5s"],
+                            "ols_lat": past_snap.get("ols_predicted_latency_5s", past_snap["predicted_latency_5s"]),
                             "base_lat": past_snap["latency_ms"],
                             "actual_lat": snapshot["latency_ms"],
                             "pred_unstable": past_snap["predicted_mos_5s"] < 3.60 or past_snap["status"] != "STABLE",
@@ -596,19 +768,25 @@ class CallGuardEngine:
         """
         Computes packet loss percentage over the active window using sequence numbers:
           expected = (max_seq - min_seq + 1)
-          received_unique = len(unique_seqs)
+          received_unique = len(unique_seqs_in_range)
           lost = max(0, expected - received_unique)
-        Automatically reconciles out-of-order packets that arrived within the window.
+        Anchors min_seq to in-order packets in the window so a stale out-of-order packet
+        from an earlier window cannot inflate expected sequence counts, while still
+        reconciling out-of-order packets that belong to the current window.
         """
         if not window_list:
             return 0.0
-        unique_seqs = {pkt["seq_num"] for pkt in window_list}
-        min_s = min(unique_seqs)
-        max_s = max(unique_seqs)
+        in_order_seqs = [pkt["seq_num"] for pkt in window_list if pkt.get("is_in_order", True)]
+        all_seqs = {pkt["seq_num"] for pkt in window_list}
+        min_s = min(in_order_seqs) if in_order_seqs else min(all_seqs)
+        valid_seqs = {s for s in all_seqs if s >= min_s}
+        if not valid_seqs:
+            return 0.0
+        max_s = max(valid_seqs)
         expected = max_s - min_s + 1
         if expected <= 0:
             return 0.0
-        lost = max(0, expected - len(unique_seqs))
+        lost = max(0, expected - len(valid_seqs))
         return (lost / expected) * 100.0
 
     def _build_snapshot(self, now_perf: float = None) -> dict:
@@ -632,8 +810,9 @@ class CallGuardEngine:
         active_duration = min(self.window_seconds, max(0.5, now_perf - prof_start))
 
         if window_list:
-            wire_latency_ms = sum(p["wire_latency_ms"] for p in window_list) / len(window_list)
-            eff_latency_ms = sum(p["eff_latency_ms"] for p in window_list) / len(window_list)
+            valid_lat_pkts = [p for p in window_list if p.get("valid_ts", True)] or window_list
+            wire_latency_ms = sum(p["wire_latency_ms"] for p in valid_lat_pkts) / len(valid_lat_pkts)
+            eff_latency_ms = sum(p["eff_latency_ms"] for p in valid_lat_pkts) / len(valid_lat_pkts)
             total_wire_bytes = sum(p["wire_bytes"] for p in window_list)
             total_sim_bytes = sum(p["sim_bytes"] for p in window_list)
 
@@ -662,32 +841,86 @@ class CallGuardEngine:
             active_jit_ms = eff_jitter_ms
             active_bw_kbps = eff_bandwidth_kbps
 
+        # Extract instantaneous 0.5s sub-window metrics (strictly causal: (now_perf - 0.5s, now_perf])
+        recent_pkts = [p for p in window_list if p["recv_perf"] >= now_perf - 0.5001]
+        if recent_pkts:
+            valid_recent = [p for p in recent_pkts if p.get("valid_ts", True)] or recent_pkts
+            lat_key = "wire_latency_ms" if mode == "real_udp" else "eff_latency_ms"
+            bytes_key = "wire_bytes" if mode == "real_udp" else "sim_bytes"
+            inst_lat_ms = sum(p[lat_key] for p in valid_recent) / len(valid_recent)
+            inst_bw_kbps = (sum(p[bytes_key] for p in recent_pkts) * 8.0) / 0.5 / 1000.0
+            inst_loss_pct = self._compute_window_loss_pct(recent_pkts)
+            if len(valid_recent) >= 2:
+                inst_jit_ms = sum(
+                    abs(valid_recent[k][lat_key] - valid_recent[k - 1][lat_key])
+                    for k in range(1, len(valid_recent))
+                ) / (len(valid_recent) - 1)
+            else:
+                inst_jit_ms = active_jit_ms
+        else:
+            inst_lat_ms = active_lat_ms
+            inst_bw_kbps = active_bw_kbps
+            inst_loss_pct = loss_pct
+            inst_jit_ms = active_jit_ms
+
         # Compute both Standard ITU-T G.107 E-Model and Composite Video-Call Heuristic
         r_g107, mos_g107 = self.compute_g107_emodel(active_lat_ms, active_jit_ms, loss_pct)
         r_video, mos_video = self.compute_qos_mos(active_lat_ms, active_jit_ms, loss_pct, active_bw_kbps)
 
-        # Compute Trend Slopes strictly from past history up to now (no future leakage)
+        # Build strictly causal 2.5s window series and 0.5s instantaneous sub-window series
         lat_series = [h["latency_ms"] for h in recent_hist] + [active_lat_ms]
         jit_series = [h["jitter_ms"] for h in recent_hist] + [active_jit_ms]
         loss_series = [h["packet_loss_pct"] for h in recent_hist] + [loss_pct]
         bw_series = [h["bandwidth_kbps"] for h in recent_hist] + [active_bw_kbps]
 
-        lat_slope = self._linear_slope(lat_series)
-        jit_slope = self._linear_slope(jit_series)
-        loss_slope = self._linear_slope(loss_series)
-        bw_slope = self._linear_slope(bw_series)
+        inst_lat_series = [h.get("inst_latency_ms", h["latency_ms"]) for h in recent_hist] + [inst_lat_ms]
+        inst_jit_series = [h.get("inst_jitter_ms", h["jitter_ms"]) for h in recent_hist] + [inst_jit_ms]
+        inst_loss_series = [h.get("inst_loss_pct", h["packet_loss_pct"]) for h in recent_hist] + [inst_loss_pct]
+        inst_bw_series = [h.get("inst_bandwidth_kbps", h["bandwidth_kbps"]) for h in recent_hist] + [inst_bw_kbps]
 
-        # Forecast metrics 5 seconds into the future (Linear Regression vs. Naive Persistence Baseline)
+        # 1. Original 8-Sample OLS Linear Regression Slopes & 5s Forecasts (preserved for comparison)
+        ols_lat_slope = self._linear_slope(lat_series)
+        ols_jit_slope = self._linear_slope(jit_series)
+        ols_loss_slope = self._linear_slope(loss_series)
+        ols_bw_slope = self._linear_slope(bw_series)
+
         horizon_sec = 5.0
-        pred_lat = max(0.1, active_lat_ms + lat_slope * horizon_sec)
-        pred_jit = max(0.05, active_jit_ms + jit_slope * horizon_sec)
-        pred_loss = max(0.0, min(100.0, loss_pct + loss_slope * horizon_sec))
-        pred_bw = max(50.0, active_bw_kbps + bw_slope * horizon_sec)
+        ols_pred_lat = max(0.1, active_lat_ms + ols_lat_slope * horizon_sec)
+        ols_pred_jit = max(0.05, active_jit_ms + ols_jit_slope * horizon_sec)
+        ols_pred_loss = max(0.0, min(100.0, loss_pct + ols_loss_slope * horizon_sec))
+        ols_pred_bw = max(50.0, active_bw_kbps + ols_bw_slope * horizon_sec)
+        _, ols_pred_mos_5s = self.compute_qos_mos(ols_pred_lat, ols_pred_jit, ols_pred_loss, ols_pred_bw)
+
+        # 2. Adaptive Regime-Aware Hybrid 5s Forecasts (Primary Model)
+        hyb_lat, lat_slope, is_step_lat = self._adaptive_forecast(
+            lat_series, inst_lat_series, 0.5, horizon_sec, "latency"
+        )
+        hyb_bw, bw_slope, is_step_bw = self._adaptive_forecast(
+            bw_series, inst_bw_series, 0.5, horizon_sec, "bandwidth"
+        )
+        is_step_regime = is_step_lat and is_step_bw
+        hyb_jit, jit_slope, _ = self._adaptive_forecast(
+            jit_series, inst_jit_series, 0.5, horizon_sec, "jitter", is_step_regime
+        )
+        hyb_loss, loss_slope, _ = self._adaptive_forecast(
+            loss_series, inst_loss_series, 0.5, horizon_sec, "loss", is_step_regime
+        )
+
+        # Coupled congestion recovery scaling when both latency and bandwidth confirm rapid recovery
+        if hyb_lat < active_lat_ms - 15.0 and hyb_bw > active_bw_kbps + 250.0:
+            excess_lat_ratio = max(0.0, (hyb_lat - 20.0) / max(active_lat_ms - 20.0, 1.0))
+            hyb_loss = min(hyb_loss, loss_pct * excess_lat_ratio)
+            hyb_jit = min(hyb_jit, 2.0 + (active_jit_ms - 2.0) * excess_lat_ratio)
+
+        pred_lat = max(0.1, hyb_lat)
+        pred_jit = max(0.05, hyb_jit)
+        pred_loss = max(0.0, min(100.0, hyb_loss))
+        pred_bw = max(50.0, hyb_bw)
 
         _, pred_mos_g107_5s = self.compute_g107_emodel(pred_lat, pred_jit, pred_loss)
         pred_r, pred_mos_5s = self.compute_qos_mos(pred_lat, pred_jit, pred_loss, pred_bw)
 
-        # Naive persistence baseline assumes metrics in +5s remain identical to current step t
+        # 3. Naive persistence baseline assumes metrics in +5s remain identical to current step t
         baseline_mos_5s = mos_video
 
         # Stability evaluation
@@ -769,10 +1002,16 @@ class CallGuardEngine:
             "epoch": now_perf,
             "timestamp": time.strftime("%H:%M:%S"),
             "measurement_mode": mode,
+            "predictor_model": "adaptive_hybrid",
             "latency_ms": round(active_lat_ms, 2),
             "jitter_ms": round(active_jit_ms, 2),
             "packet_loss_pct": round(loss_pct, 2),
             "bandwidth_kbps": round(active_bw_kbps, 0),
+            # Sub-window (0.5s) instantaneous causal state
+            "inst_latency_ms": round(inst_lat_ms, 2),
+            "inst_jitter_ms": round(inst_jit_ms, 2),
+            "inst_loss_pct": round(inst_loss_pct, 2),
+            "inst_bandwidth_kbps": round(inst_bw_kbps, 0),
             # Standard ITU-T G.107 E-Model (Audio/Voice standard)
             "r_factor_g107": r_g107,
             "mos_g107": mos_g107,
@@ -784,8 +1023,13 @@ class CallGuardEngine:
             "baseline_mos_5s": baseline_mos_5s,
             "predicted_latency_5s": round(pred_lat, 1),
             "predicted_jitter_5s": round(pred_jit, 1),
+            # Original 8-Sample OLS Linear Regression forecasts (preserved for head-to-head evaluation)
+            "ols_predicted_mos_5s": ols_pred_mos_5s,
+            "ols_predicted_latency_5s": round(ols_pred_lat, 1),
+            "ols_predicted_jitter_5s": round(ols_pred_jit, 1),
             "lat_slope": round(lat_slope, 2),
             "jit_slope": round(jit_slope, 2),
+            "ols_lat_slope": round(ols_lat_slope, 2),
             "est_sec_to_drop": est_sec_to_drop,
             "status": status,
             "badge_text": badge_text,
@@ -808,22 +1052,34 @@ class CallGuardEngine:
         }
 
     def get_live_validation_summary(self) -> dict:
-        """Computes rolling MAE and RMSE comparing the 5s Regression Predictor vs. Naive Baseline."""
+        """Computes rolling MAE and RMSE comparing Adaptive Hybrid, 8-Sample OLS, and Naive Baseline."""
         with self.lock:
             pairs = list(self.validation_pairs)
         n = len(pairs)
         if n == 0:
-            return {"samples": 0, "reg_mos_mae": None, "base_mos_mae": None, "reg_mos_rmse": None, "base_mos_rmse": None}
+            return {
+                "samples": 0,
+                "reg_mos_mae": None,
+                "ols_mos_mae": None,
+                "base_mos_mae": None,
+                "reg_mos_rmse": None,
+                "ols_mos_rmse": None,
+                "base_mos_rmse": None,
+            }
 
         reg_mae = sum(abs(p["pred_mos"] - p["actual_mos"]) for p in pairs) / n
+        ols_mae = sum(abs(p.get("ols_mos", p["pred_mos"]) - p["actual_mos"]) for p in pairs) / n
         base_mae = sum(abs(p["base_mos"] - p["actual_mos"]) for p in pairs) / n
         reg_rmse = math.sqrt(sum((p["pred_mos"] - p["actual_mos"]) ** 2 for p in pairs) / n)
+        ols_rmse = math.sqrt(sum((p.get("ols_mos", p["pred_mos"]) - p["actual_mos"]) ** 2 for p in pairs) / n)
         base_rmse = math.sqrt(sum((p["base_mos"] - p["actual_mos"]) ** 2 for p in pairs) / n)
         return {
             "samples": n,
             "reg_mos_mae": round(reg_mae, 3),
+            "ols_mos_mae": round(ols_mae, 3),
             "base_mos_mae": round(base_mae, 3),
             "reg_mos_rmse": round(reg_rmse, 3),
+            "ols_mos_rmse": round(ols_rmse, 3),
             "base_mos_rmse": round(base_rmse, 3),
         }
 

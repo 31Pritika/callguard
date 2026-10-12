@@ -278,6 +278,82 @@ class TestCallGuardMeasurementsAndQoS(unittest.TestCase):
             peer_running = False
             peer_sock.close()
 
+    def test_stale_out_of_order_packet_does_not_corrupt_window_loss(self):
+        """
+        A stale out-of-order packet from before the current window/session baseline (e.g., seq 5
+        arriving during seq 100..105) must not inflate window packet_loss_pct or corrupt total_lost.
+        """
+        t0 = 700.0
+        self.engine.profile_start_time = t0
+        # Receive in-order packets 100..105 (0% loss in window)
+        for idx, seq in enumerate([100, 101, 102, 103, 104, 105]):
+            t_recv = t0 + (idx + 1) * 0.025
+            pkt = make_udp_packet(seq, send_perf=t_recv - 0.010)
+            self.engine.process_incoming_packet(pkt, recv_perf=t_recv)
+
+        # Now a very old packet (seq 5, < min_seq_seen=100) arrives late
+        t_late = t0 + 0.200
+        self.engine.process_incoming_packet(
+            make_udp_packet(5, send_perf=t_late - 0.050), recv_perf=t_late
+        )
+
+        self.assertEqual(self.engine.out_of_order_packets, 1)
+        self.assertEqual(self.engine.total_lost, 0)
+        snap = self.engine._build_snapshot(now_perf=t_late + 0.01)
+        self.assertAlmostEqual(snap["packet_loss_pct"], 0.0, places=2)
+
+    def test_out_of_order_packet_does_not_corrupt_rfc3550_jitter(self):
+        """Out-of-order packets with delayed transit times must not corrupt the in-order RFC 3550 jitter state."""
+        t0 = 800.0
+        self.engine.wire_rfc_jitter_ms = 0.0
+        # Send in-order packets 1, 2, 4 with identical 10ms transit time -> jitter = 0.0ms
+        for idx, seq in enumerate([1, 2, 4]):
+            t_recv = t0 + (idx + 1) * 0.025
+            self.engine.process_incoming_packet(
+                make_udp_packet(seq, send_perf=t_recv - 0.010), recv_perf=t_recv
+            )
+        self.assertAlmostEqual(self.engine.wire_rfc_jitter_ms, 0.0, places=4)
+
+        # Late out-of-order packet seq 3 arrives with 180ms transit time
+        t_late = t0 + 0.100
+        self.engine.process_incoming_packet(
+            make_udp_packet(3, send_perf=t_late - 0.180), recv_perf=t_late
+        )
+        self.assertEqual(self.engine.out_of_order_packets, 1)
+        self.assertAlmostEqual(self.engine.wire_rfc_jitter_ms, 0.0, places=4)
+
+    def test_adaptive_hybrid_predictor_prevents_step_jump_overshoot(self):
+        """
+        After a single-step latency jump (18ms -> 155ms) followed by a plateau, the 8-sample OLS
+        regression on the 2.5s window overshoots (>250ms), whereas the Adaptive Hybrid Predictor
+        detects the high Jump Dominance Ratio and anchors near the ~155ms plateau.
+        """
+        import evaluate_predictor as ep
+
+        snaps = ep.run_trace_for_scenario("sudden_spike", seed=102)
+        # Check step at t = 9.0s (step_idx = 17, 3.0s after the step jump at t = 6.0s)
+        snap_t9 = snaps[17]
+        self.assertAlmostEqual(snap_t9["time_sec"], 9.0, places=1)
+        # Original 8-step OLS overshoots above 300ms due to 2.5s boxcar ramp
+        self.assertGreater(snap_t9["ols_predicted_latency_5s"], 300.0)
+        # Adaptive Hybrid Predictor stays anchored near the true 155ms plateau
+        self.assertLess( abs(snap_t9["predicted_latency_5s"] - 155.0), 15.0)
+
+    def test_adaptive_hybrid_predictor_prevents_recovery_floor_clamping(self):
+        """
+        After recovery finishes at 18ms, un-damped 8-sample OLS clamps predicted latency to 0.1ms,
+        whereas the Adaptive Hybrid Predictor detects the post-recovery plateau (~18ms).
+        """
+        import evaluate_predictor as ep
+
+        snaps = ep.run_trace_for_scenario("recovery", seed=104)
+        # Check step at t = 13.5s (step_idx = 26, after recovery reached 18ms at t = 11.0s)
+        snap_t13_5 = snaps[26]
+        self.assertAlmostEqual(snap_t13_5["time_sec"], 13.5, places=1)
+        self.assertAlmostEqual(snap_t13_5["ols_predicted_latency_5s"], 0.1, places=1)
+        self.assertAlmostEqual(snap_t13_5["predicted_latency_5s"], 18.0, delta=3.0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

@@ -1,20 +1,27 @@
 """
 CallGuard - Reproducible 5-Second Predictor Evaluation Suite
 ============================================================
-Evaluates the 5-second OLS Linear Regression Predictor against a Naive
-Persistence Baseline across 6 network scenarios:
-  1. stable               - Steady low-latency network
-  2. gradual_degradation  - Progressive congestion ramp (20ms -> 185ms)
-  3. sudden_spike         - Abrupt step jump to high latency (140ms) & jitter (38ms)
-  4. packet_loss          - Sustained 9% UDP packet loss with moderate delay
-  5. recovery             - Transition from congested (175ms) back to optimal (18ms)
-  6. real_udp_loopback    - Live physical UDP socket traffic on 127.0.0.1
+Evaluates and compares three 5-second forecasting models side-by-side across
+6 network scenarios:
+  1. Adaptive Regime-Aware Hybrid Predictor (Primary CallGuard Model)
+  2. Original 8-Sample OLS Linear Regression Predictor (Un-damped 2.5s window OLS)
+  3. Naive Persistence Baseline (predicts y_{t+5s} = y_t)
 
-Methodology & Leakage Prevention:
+Scenarios evaluated:
+  1. stable               - Steady low-latency network (18ms lat, 2ms jit, 0% loss)
+  2. gradual_degradation  - Progressive congestion ramp (20ms -> 185ms over 15s)
+  3. sudden_spike         - Abrupt step jump to high latency (155ms) & jitter (38ms)
+  4. packet_loss          - Sustained 9.5% UDP packet loss with moderate delay (70ms)
+  5. recovery             - Transition from congested (170ms) back to optimal (18ms)
+  6. real_udp_loopback    - Live physical UDP socket traffic on localhost (127.0.0.1)
+
+Methodology, +5.0s Alignment & Leakage Prevention:
 - Sampling interval dt = 0.5s; prediction horizon H = 5.0s (10 steps ahead).
-- At step index i (time t_i), the predictor only observes history[max(0, i-8) : i+1].
-- Future observations (indices > i) are never accessible at prediction time.
-- Once the full scenario trace finishes, forecast[i] is paired with actual[i + 10].
+- At step index i (time t_i), the predictor only observes packets received up to t_i
+  and snapshot history[max(0, i-8) : i+1]. Future packets (indices > i) have not
+  even been generated when forecast[i] is computed.
+- Once the full scenario trace finishes, forecast[i] is paired with actual[i + 10]
+  and verified for exact +5.0s alignment (fut["time_sec"] - cur["time_sec"] == 5.0).
 - Exports step-by-step trace to 'evaluation_trace.csv' and summary metrics to
   'evaluation_summary.csv'.
 """
@@ -23,8 +30,10 @@ import csv
 import math
 import os
 import random
+import socket
 import struct
 import sys
+import threading
 import time
 
 from network_engine import (
@@ -178,23 +187,40 @@ def run_trace_for_scenario(scenario_name: str, seed: int = 42) -> list:
     return snapshots
 
 
-def run_real_udp_loopback_trace(duration_steps: int = 26) -> list:
+def run_real_udp_loopback_trace(duration_steps: int = 24) -> list:
     """
     Runs CallGuardEngine in real_udp mode over a live OS UDP loopback socket
-    for duration_steps * 0.5s and collects actual measured snapshots.
+    (127.0.0.1) and samples snapshots directly every 0.5s without racing two
+    independent sleep loops.
+    Note: This validates local OS kernel UDP socket transit and throughput on a
+    single machine (127.0.0.1), NOT multi-machine LAN/WAN transit.
     """
     engine = CallGuardEngine(udp_port=5012)
     engine.set_profile("real_udp")
-    engine.start()
+    with engine.lock:
+        engine.running = True
+        shared_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        shared_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        shared_sock.bind((engine.udp_host, engine.udp_port))
+        shared_sock.settimeout(0.5)
+
+    threading.Thread(target=engine._udp_receiver_loop, args=(shared_sock,), daemon=True).start()
+    threading.Thread(target=engine._udp_sender_loop, args=(shared_sock,), daemon=True).start()
+
     snapshots = []
     try:
+        start_wall = time.perf_counter()
         for step_idx in range(duration_steps):
-            time.sleep(DT_SEC)
-            state = engine.get_dashboard_state()
-            snap = dict(state["current"])
+            target_wake = start_wall + (step_idx + 1) * DT_SEC
+            sleep_rem = target_wake - time.perf_counter()
+            if sleep_rem > 0:
+                time.sleep(sleep_rem)
+            snap = engine._build_snapshot()
             snap["step_idx"] = step_idx
             snap["time_sec"] = round((step_idx + 1) * DT_SEC, 1)
             snap["scenario"] = "real_udp_loopback"
+            with engine.lock:
+                engine.history.append(snap)
             snapshots.append(snap)
     finally:
         engine.stop()
@@ -203,27 +229,42 @@ def run_real_udp_loopback_trace(duration_steps: int = 26) -> list:
 
 def evaluate_paired_predictions(snapshots: list, scenario_name: str):
     """
-    Pairs predictions made at index i with actual observations at index i + HORIZON_STEPS.
-    Computes MAE, RMSE, TP, FP, TN, FN, Precision, Recall, and F1 for both:
-      - CallGuard 5s Linear Regression Predictor
-      - Naive Persistence Baseline (predicts y_{t+5s} = y_t)
+    Pairs predictions made at index i with actual observations at index i + HORIZON_STEPS (+5.0s).
+    Computes MAE, RMSE, TP, FP, TN, FN, Precision, Recall, and F1 for all three models:
+      1. CallGuard Adaptive Regime-Aware Hybrid Predictor (reg_*)
+      2. Original 8-Sample OLS Linear Regression Predictor (ols_*)
+      3. Naive Persistence Baseline (base_*, predicts y_{t+5s} = y_t)
     """
     pairs = []
     for i in range(len(snapshots) - HORIZON_STEPS):
         cur = snapshots[i]
         fut = snapshots[i + HORIZON_STEPS]
 
+        # Verify exact +5.0s horizon alignment
+        horizon_diff = round(fut["time_sec"] - cur["time_sec"], 3)
+        assert abs(horizon_diff - 5.0) < 1e-6, f"Horizon misalignment: {horizon_diff}s != 5.0s"
+
         # Instability ground truth at t + 5s: MOS < 3.65 or status in (WARNING, CRITICAL)
         actual_unstable = 1 if (fut["mos"] < 3.65 or fut["status"] != "STABLE") else 0
 
-        # Regression predictor instability forecast made at time t for t + 5s
+        # 1. Adaptive Hybrid Predictor instability forecast made at time t for t + 5s
         reg_pred_unstable = 1 if (
             cur["predicted_mos_5s"] < 3.65
             or cur["predicted_latency_5s"] >= 100.0
             or cur["predicted_jitter_5s"] >= 20.0
         ) else 0
 
-        # Baseline persistence instability forecast made at time t (assumes state at t persists at t+5s)
+        # 2. Original 8-Sample OLS Regression instability forecast made at time t for t + 5s
+        ols_pred_mos = cur.get("ols_predicted_mos_5s", cur["predicted_mos_5s"])
+        ols_pred_lat = cur.get("ols_predicted_latency_5s", cur["predicted_latency_5s"])
+        ols_pred_jit = cur.get("ols_predicted_jitter_5s", cur["predicted_jitter_5s"])
+        ols_pred_unstable = 1 if (
+            ols_pred_mos < 3.65
+            or ols_pred_lat >= 100.0
+            or ols_pred_jit >= 20.0
+        ) else 0
+
+        # 3. Baseline persistence instability forecast made at time t (assumes state at t persists at t+5s)
         base_pred_unstable = 1 if (
             cur["mos"] < 3.65
             or cur["latency_ms"] >= 100.0
@@ -236,17 +277,21 @@ def evaluate_paired_predictions(snapshots: list, scenario_name: str):
             "future_t_sec": fut["time_sec"],
             "cur_lat_ms": cur["latency_ms"],
             "reg_pred_lat_5s": cur["predicted_latency_5s"],
+            "ols_pred_lat_5s": ols_pred_lat,
             "base_pred_lat_5s": cur["latency_ms"],
             "actual_lat_5s": fut["latency_ms"],
             "cur_jit_ms": cur["jitter_ms"],
             "reg_pred_jit_5s": cur["predicted_jitter_5s"],
+            "ols_pred_jit_5s": ols_pred_jit,
             "base_pred_jit_5s": cur["jitter_ms"],
             "actual_jit_5s": fut["jitter_ms"],
             "cur_mos": cur["mos"],
             "reg_pred_mos_5s": cur["predicted_mos_5s"],
+            "ols_pred_mos_5s": ols_pred_mos,
             "base_pred_mos_5s": cur["baseline_mos_5s"],
             "actual_mos_5s": fut["mos"],
             "reg_pred_unstable": reg_pred_unstable,
+            "ols_pred_unstable": ols_pred_unstable,
             "base_pred_unstable": base_pred_unstable,
             "actual_unstable": actual_unstable,
         })
@@ -272,18 +317,23 @@ def evaluate_paired_predictions(snapshots: list, scenario_name: str):
         return tp, fp, tn, fn, prec, rec, f1
 
     reg_tp, reg_fp, reg_tn, reg_fn, reg_prec, reg_rec, reg_f1 = classification_stats("reg_pred_unstable")
+    ols_tp, ols_fp, ols_tn, ols_fn, ols_prec, ols_rec, ols_f1 = classification_stats("ols_pred_unstable")
     base_tp, base_fp, base_tn, base_fn, base_prec, base_rec, base_f1 = classification_stats("base_pred_unstable")
 
     summary = {
         "scenario": scenario_name,
         "paired_samples": n,
         "reg_lat_mae_ms": round(mae("reg_pred_lat_5s", "actual_lat_5s"), 2),
+        "ols_lat_mae_ms": round(mae("ols_pred_lat_5s", "actual_lat_5s"), 2),
         "base_lat_mae_ms": round(mae("base_pred_lat_5s", "actual_lat_5s"), 2),
         "reg_lat_rmse_ms": round(rmse("reg_pred_lat_5s", "actual_lat_5s"), 2),
+        "ols_lat_rmse_ms": round(rmse("ols_pred_lat_5s", "actual_lat_5s"), 2),
         "base_lat_rmse_ms": round(rmse("base_pred_lat_5s", "actual_lat_5s"), 2),
         "reg_mos_mae": round(mae("reg_pred_mos_5s", "actual_mos_5s"), 3),
+        "ols_mos_mae": round(mae("ols_pred_mos_5s", "actual_mos_5s"), 3),
         "base_mos_mae": round(mae("base_pred_mos_5s", "actual_mos_5s"), 3),
         "reg_mos_rmse": round(rmse("reg_pred_mos_5s", "actual_mos_5s"), 3),
+        "ols_mos_rmse": round(rmse("ols_pred_mos_5s", "actual_mos_5s"), 3),
         "base_mos_rmse": round(rmse("base_pred_mos_5s", "actual_mos_5s"), 3),
         "reg_tp": reg_tp,
         "reg_fp": reg_fp,
@@ -292,6 +342,13 @@ def evaluate_paired_predictions(snapshots: list, scenario_name: str):
         "reg_precision": round(reg_prec, 3),
         "reg_recall": round(reg_rec, 3),
         "reg_f1": round(reg_f1, 3),
+        "ols_tp": ols_tp,
+        "ols_fp": ols_fp,
+        "ols_tn": ols_tn,
+        "ols_fn": ols_fn,
+        "ols_precision": round(ols_prec, 3),
+        "ols_recall": round(ols_rec, 3),
+        "ols_f1": round(ols_f1, 3),
         "base_tp": base_tp,
         "base_fp": base_fp,
         "base_tn": base_tn,
@@ -319,9 +376,9 @@ def main():
     all_pairs = []
     summaries = []
 
-    print("=" * 105)
-    print(" CallGuard 5-Second Predictor Evaluation (OLS Linear Regression vs. Naive Persistence Baseline)")
-    print("=" * 105)
+    print("=" * 124)
+    print(" CallGuard 5-Second Predictor Evaluation: Adaptive Hybrid (Hyb) vs. 8-Step OLS (OLS8) vs. Naive Baseline (Base)")
+    print("=" * 124)
 
     for idx, sc in enumerate(scenarios):
         snaps = run_trace_for_scenario(sc, seed=100 + idx)
@@ -329,66 +386,14 @@ def main():
         summaries.append(summary)
         all_pairs.extend(pairs)
 
-    # Also run live physical UDP socket loopback evaluation
+    # Also run live physical UDP socket loopback evaluation on 127.0.0.1
     real_snaps = run_real_udp_loopback_trace(duration_steps=24)
     real_summary, real_pairs = evaluate_paired_predictions(real_snaps, "real_udp_loopback")
     summaries.append(real_summary)
     all_pairs.extend(real_pairs)
 
     # Compute overall aggregate across all paired observations
-    total_n = len(all_pairs)
-    reg_lat_mae = sum(abs(p["reg_pred_lat_5s"] - p["actual_lat_5s"]) for p in all_pairs) / total_n
-    base_lat_mae = sum(abs(p["base_pred_lat_5s"] - p["actual_lat_5s"]) for p in all_pairs) / total_n
-    reg_lat_rmse = math.sqrt(sum((p["reg_pred_lat_5s"] - p["actual_lat_5s"]) ** 2 for p in all_pairs) / total_n)
-    base_lat_rmse = math.sqrt(sum((p["base_pred_lat_5s"] - p["actual_lat_5s"]) ** 2 for p in all_pairs) / total_n)
-
-    reg_mos_mae = sum(abs(p["reg_pred_mos_5s"] - p["actual_mos_5s"]) for p in all_pairs) / total_n
-    base_mos_mae = sum(abs(p["base_pred_mos_5s"] - p["actual_mos_5s"]) for p in all_pairs) / total_n
-    reg_mos_rmse = math.sqrt(sum((p["reg_pred_mos_5s"] - p["actual_mos_5s"]) ** 2 for p in all_pairs) / total_n)
-    base_mos_rmse = math.sqrt(sum((p["base_pred_mos_5s"] - p["actual_mos_5s"]) ** 2 for p in all_pairs) / total_n)
-
-    reg_tp = sum(1 for p in all_pairs if p["reg_pred_unstable"] == 1 and p["actual_unstable"] == 1)
-    reg_fp = sum(1 for p in all_pairs if p["reg_pred_unstable"] == 1 and p["actual_unstable"] == 0)
-    reg_tn = sum(1 for p in all_pairs if p["reg_pred_unstable"] == 0 and p["actual_unstable"] == 0)
-    reg_fn = sum(1 for p in all_pairs if p["reg_pred_unstable"] == 0 and p["actual_unstable"] == 1)
-    reg_prec = reg_tp / (reg_tp + reg_fp) if (reg_tp + reg_fp) > 0 else 0.0
-    reg_rec = reg_tp / (reg_tp + reg_fn) if (reg_tp + reg_fn) > 0 else 0.0
-    reg_f1 = (2 * reg_prec * reg_rec) / (reg_prec + reg_rec) if (reg_prec + reg_rec) > 0 else 0.0
-
-    base_tp = sum(1 for p in all_pairs if p["base_pred_unstable"] == 1 and p["actual_unstable"] == 1)
-    base_fp = sum(1 for p in all_pairs if p["base_pred_unstable"] == 1 and p["actual_unstable"] == 0)
-    base_tn = sum(1 for p in all_pairs if p["base_pred_unstable"] == 0 and p["actual_unstable"] == 0)
-    base_fn = sum(1 for p in all_pairs if p["base_pred_unstable"] == 0 and p["actual_unstable"] == 1)
-    base_prec = base_tp / (base_tp + base_fp) if (base_tp + base_fp) > 0 else 0.0
-    base_rec = base_tp / (base_tp + base_fn) if (base_tp + base_fn) > 0 else 0.0
-    base_f1 = (2 * base_prec * base_rec) / (base_prec + base_rec) if (base_prec + base_rec) > 0 else 0.0
-
-    overall = {
-        "scenario": "OVERALL_ALL_SCENARIOS",
-        "paired_samples": total_n,
-        "reg_lat_mae_ms": round(reg_lat_mae, 2),
-        "base_lat_mae_ms": round(base_lat_mae, 2),
-        "reg_lat_rmse_ms": round(reg_lat_rmse, 2),
-        "base_lat_rmse_ms": round(base_lat_rmse, 2),
-        "reg_mos_mae": round(reg_mos_mae, 3),
-        "base_mos_mae": round(base_mos_mae, 3),
-        "reg_mos_rmse": round(reg_mos_rmse, 3),
-        "base_mos_rmse": round(base_mos_rmse, 3),
-        "reg_tp": reg_tp,
-        "reg_fp": reg_fp,
-        "reg_tn": reg_tn,
-        "reg_fn": reg_fn,
-        "reg_precision": round(reg_prec, 3),
-        "reg_recall": round(reg_rec, 3),
-        "reg_f1": round(reg_f1, 3),
-        "base_tp": base_tp,
-        "base_fp": base_fp,
-        "base_tn": base_tn,
-        "base_fn": base_fn,
-        "base_precision": round(base_prec, 3),
-        "base_recall": round(base_rec, 3),
-        "base_f1": round(base_f1, 3),
-    }
+    overall, _ = evaluate_paired_predictions_from_pairs(all_pairs, "OVERALL_ALL_SCENARIOS")
     summaries.append(overall)
 
     # Export CSVs
@@ -406,27 +411,95 @@ def main():
 
     # Print formatted results table
     header = (
-        f"{'Scenario':<22} | {'N':>3} | "
-        f"{'Reg MOS MAE':>11} | {'Base MOS MAE':>12} | "
-        f"{'Reg MOS RMSE':>12} | {'Base MOS RMSE':>13} | "
-        f"{'Reg P/R/F1':<18} | {'Base P/R/F1':<18}"
+        f"{'Scenario':<21} | {'N':>3} | "
+        f"{'Lat MAE (Hyb/OLS/Base)':<22} | "
+        f"{'MOS MAE (Hyb/OLS/Base)':<22} | "
+        f"{'MOS RMSE (Hyb/OLS/Base)':<23} | "
+        f"{'Hyb P/R/F1':<16} | {'Base P/R/F1':<16}"
     )
     print(header)
     print("-" * len(header))
     for s in summaries:
         if s["scenario"] == "OVERALL_ALL_SCENARIOS":
             print("-" * len(header))
-        reg_prf = f"{s['reg_precision']:.2f}/{s['reg_recall']:.2f}/{s['reg_f1']:.2f}"
+        lat_str = f"{s['reg_lat_mae_ms']:5.2f}/{s['ols_lat_mae_ms']:5.2f}/{s['base_lat_mae_ms']:5.2f}"
+        mos_mae_str = f"{s['reg_mos_mae']:5.3f}/{s['ols_mos_mae']:5.3f}/{s['base_mos_mae']:5.3f}"
+        mos_rmse_str = f"{s['reg_mos_rmse']:5.3f}/{s['ols_mos_rmse']:5.3f}/{s['base_mos_rmse']:5.3f}"
+        hyb_prf = f"{s['reg_precision']:.2f}/{s['reg_recall']:.2f}/{s['reg_f1']:.2f}"
         base_prf = f"{s['base_precision']:.2f}/{s['base_recall']:.2f}/{s['base_f1']:.2f}"
         print(
-            f"{s['scenario']:<22} | {s['paired_samples']:>3} | "
-            f"{s['reg_mos_mae']:>11.3f} | {s['base_mos_mae']:>12.3f} | "
-            f"{s['reg_mos_rmse']:>12.3f} | {s['base_mos_rmse']:>13.3f} | "
-            f"{reg_prf:<18} | {base_prf:<18}"
+            f"{s['scenario']:<21} | {s['paired_samples']:>3} | "
+            f"{lat_str:<22} | "
+            f"{mos_mae_str:<22} | "
+            f"{mos_rmse_str:<23} | "
+            f"{hyb_prf:<16} | {base_prf:<16}"
         )
     print("=" * len(header))
-    print(f"Exported step-by-step trace ({total_n} pairs) to: {trace_csv_path}")
+    print(f"Exported step-by-step trace ({len(all_pairs)} pairs) to: {trace_csv_path}")
     print(f"Exported scenario summary table to:            {summary_csv_path}")
+
+
+def evaluate_paired_predictions_from_pairs(pairs: list, label: str):
+    n = len(pairs)
+
+    def mae(pred_key, act_key):
+        return sum(abs(p[pred_key] - p[act_key]) for p in pairs) / n
+
+    def rmse(pred_key, act_key):
+        return math.sqrt(sum((p[pred_key] - p[act_key]) ** 2 for p in pairs) / n)
+
+    def classification_stats(pred_key):
+        tp = sum(1 for p in pairs if p[pred_key] == 1 and p["actual_unstable"] == 1)
+        fp = sum(1 for p in pairs if p[pred_key] == 1 and p["actual_unstable"] == 0)
+        tn = sum(1 for p in pairs if p[pred_key] == 0 and p["actual_unstable"] == 0)
+        fn = sum(1 for p in pairs if p[pred_key] == 0 and p["actual_unstable"] == 1)
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = (2 * prec * rec) / (prec + rec) if (prec + rec) > 0 else 0.0
+        return tp, fp, tn, fn, prec, rec, f1
+
+    reg_tp, reg_fp, reg_tn, reg_fn, reg_prec, reg_rec, reg_f1 = classification_stats("reg_pred_unstable")
+    ols_tp, ols_fp, ols_tn, ols_fn, ols_prec, ols_rec, ols_f1 = classification_stats("ols_pred_unstable")
+    base_tp, base_fp, base_tn, base_fn, base_prec, base_rec, base_f1 = classification_stats("base_pred_unstable")
+
+    summary = {
+        "scenario": label,
+        "paired_samples": n,
+        "reg_lat_mae_ms": round(mae("reg_pred_lat_5s", "actual_lat_5s"), 2),
+        "ols_lat_mae_ms": round(mae("ols_pred_lat_5s", "actual_lat_5s"), 2),
+        "base_lat_mae_ms": round(mae("base_pred_lat_5s", "actual_lat_5s"), 2),
+        "reg_lat_rmse_ms": round(rmse("reg_pred_lat_5s", "actual_lat_5s"), 2),
+        "ols_lat_rmse_ms": round(rmse("ols_pred_lat_5s", "actual_lat_5s"), 2),
+        "base_lat_rmse_ms": round(rmse("base_pred_lat_5s", "actual_lat_5s"), 2),
+        "reg_mos_rmse": round(rmse("reg_pred_mos_5s", "actual_mos_5s"), 3),
+        "ols_mos_rmse": round(rmse("ols_pred_mos_5s", "actual_mos_5s"), 3),
+        "base_mos_rmse": round(rmse("base_pred_mos_5s", "actual_mos_5s"), 3),
+        "reg_mos_mae": round(mae("reg_pred_mos_5s", "actual_mos_5s"), 3),
+        "ols_mos_mae": round(mae("ols_pred_mos_5s", "actual_mos_5s"), 3),
+        "base_mos_mae": round(mae("base_pred_mos_5s", "actual_mos_5s"), 3),
+        "reg_tp": reg_tp,
+        "reg_fp": reg_fp,
+        "reg_tn": reg_tn,
+        "reg_fn": reg_fn,
+        "reg_precision": round(reg_prec, 3),
+        "reg_recall": round(reg_rec, 3),
+        "reg_f1": round(reg_f1, 3),
+        "ols_tp": ols_tp,
+        "ols_fp": ols_fp,
+        "ols_tn": ols_tn,
+        "ols_fn": ols_fn,
+        "ols_precision": round(ols_prec, 3),
+        "ols_recall": round(ols_rec, 3),
+        "ols_f1": round(ols_f1, 3),
+        "base_tp": base_tp,
+        "base_fp": base_fp,
+        "base_tn": base_tn,
+        "base_fn": base_fn,
+        "base_precision": round(base_prec, 3),
+        "base_recall": round(base_rec, 3),
+        "base_f1": round(base_f1, 3),
+    }
+    return summary, pairs
 
 
 if __name__ == "__main__":
