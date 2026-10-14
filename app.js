@@ -95,14 +95,14 @@ function setCellMeter(tagEl, barEl, level, pct) {
   if (level === "crit") {
     tagEl.textContent = "CRITICAL";
     tagEl.classList.add("crit");
-    barEl.style.backgroundColor = "#B81D13";
+    barEl.style.backgroundColor = "#C81E1E";
   } else if (level === "warn") {
     tagEl.textContent = "ELEVATED";
     tagEl.classList.add("warn");
-    barEl.style.backgroundColor = "#C85A00";
+    barEl.style.backgroundColor = "#B45309";
   } else {
     tagEl.textContent = "NOMINAL";
-    barEl.style.backgroundColor = "#006B44";
+    barEl.style.backgroundColor = "#057A55";
   }
   barEl.style.width = `${Math.max(3, Math.min(100, pct))}%`;
 }
@@ -197,7 +197,7 @@ function updateUI(state) {
   }
   if (statWire && cur.actual_wire_metrics) {
     const wm = cur.actual_wire_metrics;
-    statWire.textContent = `${wm.wire_latency_ms.toFixed(2)}ms / ${wm.wire_throughput_kbps.toFixed(0)}kbps`;
+    statWire.textContent = `${wm.wire_latency_ms.toFixed(2)}ms · ${wm.wire_throughput_kbps.toFixed(0)}kbps`;
   }
   statSent.textContent = state.packets.sent;
   statRecv.textContent = state.packets.received;
@@ -213,7 +213,7 @@ function drawPlot(history) {
   const rect = latCanvas.getBoundingClientRect();
   const dpr = window.devicePixelRatio || 1;
   const cssW = Math.max(300, rect.width || 820);
-  const cssH = Math.max(180, rect.height || 230);
+  const cssH = Math.max(160, rect.height || 200);
 
   if (latCanvas.width !== Math.round(cssW * dpr) || latCanvas.height !== Math.round(cssH * dpr)) {
     latCanvas.width = Math.round(cssW * dpr);
@@ -224,16 +224,18 @@ function drawPlot(history) {
   latCtx.scale(dpr, dpr);
   latCtx.clearRect(0, 0, cssW, cssH);
 
-  const padL = 48, padR = 18, padT = 18, padB = 24;
+  const padL = 48, padR = 16, padT = 16, padB = 22;
   const plotW = cssW - padL - padR;
   const plotH = cssH - padT - padB;
   const maxY = 200;
 
   // Architectural grid hairlines
-  latCtx.strokeStyle = "#D8D2C5";
+  latCtx.strokeStyle = "#D8D4CA";
   latCtx.lineWidth = 1;
-  latCtx.fillStyle = "#5C5952";
-  latCtx.font = "500 11px 'JetBrains Mono', monospace";
+  latCtx.fillStyle = "#848A96";
+  latCtx.font = "600 10px 'JetBrains Mono', monospace";
+  latCtx.textAlign = "right";
+  latCtx.textBaseline = "middle";
 
   [0, 50, 100, 150, 200].forEach((val) => {
     const y = padT + plotH - (val / maxY) * plotH;
@@ -241,14 +243,14 @@ function drawPlot(history) {
     latCtx.moveTo(padL, y);
     latCtx.lineTo(cssW - padR, y);
     latCtx.stroke();
-    latCtx.fillText(`${val}ms`, 6, y + 4);
+    latCtx.fillText(`${val}ms`, padL - 8, y);
   });
 
   // 150ms Call Drop Ceiling
   const threshY = padT + plotH - (150 / maxY) * plotH;
-  latCtx.strokeStyle = "#B81D13";
+  latCtx.strokeStyle = "#C81E1E";
   latCtx.lineWidth = 1.5;
-  latCtx.setLineDash([5, 4]);
+  latCtx.setLineDash([4, 4]);
   latCtx.beginPath();
   latCtx.moveTo(padL, threshY);
   latCtx.lineTo(cssW - padR, threshY);
@@ -258,7 +260,7 @@ function drawPlot(history) {
   if (history && history.length >= 2) {
     const drawTrace = (key, color) => {
       latCtx.strokeStyle = color;
-      latCtx.lineWidth = 2.25;
+      latCtx.lineWidth = 2;
       latCtx.beginPath();
       history.forEach((pt, idx) => {
         const x = padL + (idx / Math.max(1, history.length - 1)) * plotW;
@@ -270,8 +272,8 @@ function drawPlot(history) {
       latCtx.stroke();
     };
 
-    drawTrace("latency_ms", "#0047AB");
-    drawTrace("jitter_ms", "#C85A00");
+    drawTrace("latency_ms", "#1D4ED8");
+    drawTrace("jitter_ms", "#B45309");
   }
 
   latCtx.restore();
